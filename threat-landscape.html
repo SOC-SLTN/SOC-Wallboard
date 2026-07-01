@@ -333,6 +333,11 @@ const CONFIG = {
     // ransomware.live/apidocs (v2). No API key needed for personal use; the
     // apiKey below is only for the paid api-pro.ransomware.live tier.
     endpoint: "https://api.ransomware.live/v2/recentvictims",
+    // BEST OPTION for a SOC: a same-origin JSON file refreshed by a scheduled
+    // GitHub Action (see the workflow provided). No CORS, no proxy, works even
+    // if the player's network blocks external sites. Set to "" to use the live
+    // API directly instead. Path is relative to this HTML file.
+    localFile: "ransomware.json",
     apiKey: "",              // leave blank for the free public API
     showVictimNames: true,   // false -> show sector/region only, hide org names
     max: 26
@@ -440,13 +445,25 @@ function normVictim(v){
   let date = ds ? new Date(ds) : null; if(date && isNaN(date)) date=null;
   return { group, victim, country, sector, date };
 }
-async function fetchRansomware(){
-  if(!CONFIG.ransomware.enabled) return null;
-  const data = await grab(CONFIG.ransomware.endpoint, { json:true });
+function parseVictims(data){
   let list = Array.isArray(data) ? data : (data.victims || data.data || data.results || []);
   let items = list.map(normVictim).filter(x=>x.group || x.victim);
   items.sort((a,b)=>(b.date?.getTime()||0)-(a.date?.getTime()||0));
   return items.slice(0, CONFIG.ransomware.max);
+}
+async function fetchRansomware(){
+  if(!CONFIG.ransomware.enabled) return null;
+  // Preferred: a same-origin JSON refreshed by a scheduled job — no CORS, no
+  // proxy, reachable even on a locked-down network.
+  if(CONFIG.ransomware.localFile){
+    try{
+      const r = await fetch(CONFIG.ransomware.localFile, { cache:'no-store' });
+      if(r.ok) return parseVictims(await r.json());
+      console.warn('[wallboard] local file HTTP '+r.status+', trying live API');
+    }catch(e){ console.warn('[wallboard] local file failed, trying live API -', e.message); }
+  }
+  // Fallback: live API via the direct/proxy cascade.
+  return parseVictims(await grab(CONFIG.ransomware.endpoint, { json:true }));
 }
 
 /* ===========================================================================
