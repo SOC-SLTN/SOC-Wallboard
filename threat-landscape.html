@@ -301,10 +301,18 @@ const CONFIG = {
   subtitle: "Situational Awareness",
   refreshMinutes: 15,
 
-  // Proxy for feeds that block cross-origin browser requests (CORS).
-  // Ransomware feed is tried DIRECTLY first, then via this proxy if blocked.
-  // For a real SOC wall, host your own proxy and point this at it.
-  proxy: "https://api.allorigins.win/raw?url=",
+  // The ransomware.live API doesn't send CORS headers, so a browser can't call
+  // it directly. The board tries a direct fetch first, then falls back through
+  // these proxies IN ORDER until one returns data. Public proxies are best-effort
+  // and go up and down — for a reliable SOC wall, host your own (a ~12-line
+  // Cloudflare Worker is enough) and put it FIRST in this list. Format: a prefix
+  // that accepts the URL-encoded target, e.g. "https://proxy.internal/?url=".
+  proxies: [
+    "https://corsproxy.io/?url=",
+    "https://api.allorigins.win/raw?url=",
+    "https://api.codetabs.com/v1/proxy/?quest=",
+    "https://thingproxy.freeboard.io/fetch/"
+  ],
 
   // THREAT POSTURE ----------------------------------------------------------
   // Set the level your SOC lead declares. One of: guarded | elevated | high | severe
@@ -321,11 +329,11 @@ const CONFIG = {
   // RANSOMWARE FEED ---------------------------------------------------------
   ransomware: {
     enabled: true,
-    // Public feed of recent ransomware disclosures. VERIFY the current endpoint
-    // at ransomware.live/api — it has changed over time and a free API key may
-    // be required (add it below to send as an "X-API-KEY" header).
+    // Recent ransomware disclosures. Endpoint & fields confirmed against
+    // ransomware.live/apidocs (v2). No API key needed for personal use; the
+    // apiKey below is only for the paid api-pro.ransomware.live tier.
     endpoint: "https://api.ransomware.live/v2/recentvictims",
-    apiKey: "",              // optional free key from ransomware.live
+    apiKey: "",              // leave blank for the free public API
     showVictimNames: true,   // false -> show sector/region only, hide org names
     max: 26
   },
@@ -399,24 +407,36 @@ function mode(arr){ const m={}; let best=null,bc=0;
   arr.filter(Boolean).forEach(v=>{ m[v]=(m[v]||0)+1; if(m[v]>bc){bc=m[v];best=v;} }); return best; }
 
 async function grab(url,{json=false}={}){
-  const headers = CONFIG.ransomware.apiKey ? { 'X-API-KEY': CONFIG.ransomware.apiKey } : {};
-  // try direct first
-  try{ const r=await fetch(url,{cache:'no-store',headers}); if(r.ok) return json?r.json():r.text(); }catch(e){}
-  // fall back to proxy
-  const r2=await fetch(CONFIG.proxy+encodeURIComponent(url),{cache:'no-store'});
-  if(!r2.ok) throw new Error('HTTP '+r2.status);
-  return json?r2.json():r2.text();
+  const key = CONFIG.ransomware.apiKey;
+  // Build the ordered list of attempts: direct first, then each proxy.
+  const attempts = [
+    { label:'direct', build:()=>url, headers: key ? {'X-API-KEY':key} : {} },
+    ...CONFIG.proxies.map(p => ({ label:p, build:()=>p+encodeURIComponent(url), headers:{} }))
+  ];
+  let lastErr;
+  for(const a of attempts){
+    try{
+      const r = await fetch(a.build(), { cache:'no-store', headers:a.headers });
+      if(!r.ok){ lastErr = new Error(a.label+' HTTP '+r.status); continue; }
+      const text = await r.text();
+      if(!text || text.trim()[0] === '<'){ lastErr = new Error(a.label+' returned non-JSON'); continue; }
+      return json ? JSON.parse(text) : text;
+    }catch(e){ lastErr = new Error(a.label+' '+e.message); }
+  }
+  console.warn('[wallboard] all fetch attempts failed for', url, '-', lastErr && lastErr.message);
+  throw lastErr || new Error('all attempts failed');
 }
 
 /* ===========================================================================
    Ransomware feed
    =========================================================================== */
 function normVictim(v){
-  const group = v.group_name || v.group || v.gang || v.actor || '';
-  const victim = v.victim || v.post_title || v.title || v.name || v.company || '';
+  // Confirmed ransomware.live v2 fields first, with fallbacks for safety.
+  const group   = v.group || v.group_name || v.gang || v.actor || '';
+  const victim  = v.victim || v.post_title || v.title || v.name || v.company || '';
   const country = v.country || v.geo || v.region || '';
-  const sector = v.activity || v.sector || v.industry || v.category || '';
-  const ds = v.discovered || v.published || v.date || v.attackdate || v.created || v.publish_date;
+  const sector  = v.activity || v.sector || v.industry || v.category || '';
+  const ds = v.attackdate || v.discovered || v.published || v.date || v.created || v.publish_date;
   let date = ds ? new Date(ds) : null; if(date && isNaN(date)) date=null;
   return { group, victim, country, sector, date };
 }
@@ -487,7 +507,7 @@ function renderSpotlight(){
     <div class="dots">${ATTACK.map((_,i)=>`<i class="${i===spotIdx%ATTACK.length?'on':''}"></i>`).join('')}</div>`;
 }
 
-function setStatus(s){ const el=$('status'); el.classList.remove('live','','stale'); el.classList.add(s); }
+function setStatus(s){ const el=$('status'); el.classList.remove('live','demo','stale'); el.classList.add(s); }
 
 /* ===========================================================================
    Scroller (shared with board 1)
@@ -529,7 +549,7 @@ async function refresh(){
 
   if(live) setStatus('live');
   else if(lastRW) setStatus('stale');
-  else setStatus('live');
+  else setStatus('demo');
 
   $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 }
